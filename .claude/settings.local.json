@@ -45,7 +45,8 @@
       "Bash(grep:*)",
       "Bash(MSYS_NO_PATHCONV=1 kubectl exec zookeeper-0 -- find / -name zoo.cfg)",
       "Bash(MSYS_NO_PATHCONV=1 kubectl exec zookeeper-0:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(git:*)"
     ]
   }
 }
