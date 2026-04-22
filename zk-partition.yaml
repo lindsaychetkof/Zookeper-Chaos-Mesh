@@ -1,0 +1,22 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: zk-leader-minority-partition
+  namespace: default
+spec:
+  action: partition
+  mode: all
+  selector:
+    pods:
+      default:
+        - zk-3
+        - zk-4
+  direction: both
+  target:
+    mode: all
+    selector:
+      pods:
+        default:
+          - zk-0
+          - zk-1
+          - zk-2
