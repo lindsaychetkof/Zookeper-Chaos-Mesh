@@ -46,7 +46,14 @@
       "Bash(MSYS_NO_PATHCONV=1 kubectl exec zookeeper-0 -- find / -name zoo.cfg)",
       "Bash(MSYS_NO_PATHCONV=1 kubectl exec zookeeper-0:*)",
       "Bash(python3:*)",
+<<<<<<< HEAD
       "Bash(git:*)"
+=======
+      "Bash(minikube start:*)",
+      "Bash(kubectl apply:*)",
+      "Bash(kubectl wait:*)",
+      "Bash(nc -z 127.0.0.1 2181)"
+>>>>>>> f3d5971c9ded68284b258f39182521f7c451f94e
     ]
   }
 }

@@ -1,0 +1,138 @@
+TEST PURPOSE
+------------
+What: A 5-node ZooKeeper ensemble is partitioned into two groups where the
+      CURRENT LEADER is deliberately placed on the MINORITY (2-node) side:
+        Minority (2/5): [current_leader + one_follower] -- cannot form quorum
+        Majority (3/5): [3 remaining followers]          -- can elect a new leader
+      Groups are assigned dynamically at preflight based on who holds the lease.
+Why:  This directly tests ZAB's response when the active leader loses quorum.
+      The minority-side leader must detect it can no longer reach a majority
+      of ensemble members and step down to LOOKING state.  The majority side
+      must elect a new leader from its 3 nodes (3/5 = 60% > 50% threshold).
+      Unlike Experiment E (which does not guarantee which side gets the leader),
+      this experiment controls the partition topology so the outcome is always:
+        old leader stranded on minority  →  new leader elected on majority.
+Timeline markers captured:
+  A = partition injected
+  B = new leader detected on majority side (1-second zkServer.sh polling)
+  C = write availability confirmed on majority (inferred: majority has leader)
+  D = quorum loss confirmed on minority (all minority pods non-leader/follower)
+  E = partition healed (chaos resource deleted)
+  F = full recovery (all 5 pods Running + exactly 1 leader)
+Academic significance:
+  - Contrasts pod-kill (Experiment A) with network isolation: here the old
+    leader is alive but unreachable, so both sides initially believe they may
+    be leader -- the classic split-brain window is observable.
+  - Measures B-A: time for majority to elect a new leader.
+  - Measures D-A: time for minority to detect quorum loss and step down.
+  - Validates ZAB quorum rule: 2-node minority with the old leader cannot
+    continue serving even though the leader pod is healthy.
+  - Expected: new majority leader within ~5-15s; minority quorum loss ~10-30s.
+
+EXPERIMENT: leader_minority_partition  [Experiment G - v2 only, 5-node ensemble]
+PARTITION: [current_leader + 1 follower] (minority 2/5)
+           vs [3 remaining followers]     (majority 3/5)
+RUN: 2
+START TIME: 2026-04-20 21:11:32.092
+[2026-04-20 21:11:32.093] PREFLIGHT-5NODE attempt 1/6 at 2026-04-20 21:11:32.093
+[2026-04-20 21:11:32.145]   Check 1 PASS: all 5 zookeeper5 pods are 1/1 Running
+[2026-04-20 21:11:32.689]     zookeeper5-0: follower
+[2026-04-20 21:11:32.689]     zookeeper5-1: leader
+[2026-04-20 21:11:32.689]     zookeeper5-2: follower
+[2026-04-20 21:11:32.689]     zookeeper5-3: follower
+[2026-04-20 21:11:32.689]     zookeeper5-4: follower
+[2026-04-20 21:11:32.689]   Check 2 PASS: leader=zookeeper5-1, followers=['zookeeper5-0', 'zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4']
+[2026-04-20 21:11:32.689] PREFLIGHT-5NODE PASSED [2026-04-20 21:11:32.689]
+LEADER AT START: zookeeper5-1
+FOLLOWERS: ['zookeeper5-0', 'zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4']
+MINORITY GROUP (2/5, has current leader): ['zookeeper5-1', 'zookeeper5-0']
+MAJORITY GROUP (3/5, will elect new leader): ['zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4']
+
+[2026-04-20 21:11:32.690] Partition design: minority=['zookeeper5-1', 'zookeeper5-0'] (cannot form quorum) vs majority=['zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4'] (will retain/elect leader)
+[2026-04-20 21:11:32.690] Generated YAML: chaos_yamls/chaos_v2_leader_minority_run2_dynamic.yaml
+[2026-04-20 21:11:32.690]   NetworkChaos partition: ['zookeeper5-1', 'zookeeper5-0'] <-> ['zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4'], action=partition, direction=both, duration=60s
+[2026-04-20 21:11:32.765] [A] PARTITION INJECTED at 2026-04-20 21:11:32.765: kubectl apply -f chaos_yamls/chaos_v2_leader_minority_run2_dynamic.yaml
+[2026-04-20 21:11:32.766] --- Polling every 1s for 75 seconds (parallel, duration=60s + 15s buffer) ---
+[2026-04-20 21:11:32.766]     Minority to watch: ['zookeeper5-1', 'zookeeper5-0']  |  Majority to watch: ['zookeeper5-2', 'zookeeper5-3', 'zookeeper5-4']
+[2026-04-20 21:11:33.385] POLL: zookeeper5-0:follower | zookeeper5-1:leader | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:follower
+[2026-04-20 21:11:34.854] POLL: zookeeper5-0:follower | zookeeper5-1:leader | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:follower
+[2026-04-20 21:11:36.388] POLL: zookeeper5-0:follower | zookeeper5-1:leader | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:follower
+[2026-04-20 21:11:37.868] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:37.868]   [+5.103s] OLD LEADER STEPPED DOWN: zookeeper5-1 now reports 'not_running'
+[2026-04-20 21:11:37.868]   [+5.103s] [B] NEW LEADER ON MAJORITY SIDE: zookeeper5-4  [B-A = 5.103s]
+[2026-04-20 21:11:37.868]   [+5.103s] [C] MAJORITY WRITE AVAILABLE (inferred): zookeeper5-4 is active leader => majority side accepting writes
+[2026-04-20 21:11:37.868]   [+5.103s] [D] MINORITY QUORUM LOST: all minority pods ['zookeeper5-1', 'zookeeper5-0'] report non-quorum status (['not_running', 'not_running'])  [D-A = 5.103s]
+[2026-04-20 21:11:39.385] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:40.865] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:42.381] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:43.852] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:45.376] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:46.798] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:48.297] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:49.803] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:51.291] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:52.803] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:54.286] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:55.775] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:57.290] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:11:58.768] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:00.281] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:01.774] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:03.187] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:04.684] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:06.171] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:07.675] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:09.102] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:10.568] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:11.996] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:13.492] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:14.985] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:16.402] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:17.871] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:19.296] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:20.761] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:22.272] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:23.706] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:25.096] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:26.510] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:27.909] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:29.358] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:30.798] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:32.285] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:33.778] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:35.186] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:36.599] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:37.987] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:39.460] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:40.877] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:42.294] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:43.682] POLL: zookeeper5-0:not_running | zookeeper5-1:not_running | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:45.099] POLL: zookeeper5-0:follower | zookeeper5-1:follower | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:46.571] POLL: zookeeper5-0:follower | zookeeper5-1:follower | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:47.988] POLL: zookeeper5-0:follower | zookeeper5-1:follower | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:49.039] Chaos object still present after 75s - deleting manually ...
+[2026-04-20 21:12:49.222] FAULT REMOVED (manual) at 2026-04-20 21:12:49.222
+[2026-04-20 21:12:49.222] [E] PARTITION HEALED at 2026-04-20 21:12:49.222
+[2026-04-20 21:12:49.223] --- Polling for full recovery (all 5 pods Running, exactly 1 leader) ---
+[2026-04-20 21:12:49.690] RECOVERY POLL: pods_running=True(5/5) | zookeeper5-0:follower | zookeeper5-1:follower | zookeeper5-2:follower | zookeeper5-3:follower | zookeeper5-4:leader
+[2026-04-20 21:12:49.690] RECOVERY CONFIRMED at 2026-04-20 21:12:49.690: leader=zookeeper5-4, recovery_seconds=76.9s (from injection)
+[2026-04-20 21:12:49.690] [F] FULL RECOVERY at 2026-04-20 21:12:49.690: all 5 nodes Running + 1 leader
+
+==============================================================
+TIMELINE SUMMARY
+==============================================================
+[A] PARTITION INJECTED      : 2026-04-20 21:11:32.765
+[B] NEW MAJORITY LEADER     : 2026-04-20 21:11:37.868  (B-A = 5.103s)
+[C] MAJORITY WRITE AVAIL    : same as B (inferred from leader election)
+[D] MINORITY QUORUM LOST    : 2026-04-20 21:11:37.868  (D-A = 5.103s)
+[E] PARTITION HEALED        : 2026-04-20 21:12:49.222  (E-A = 76.5s)
+[F] FULL RECOVERY           : 2026-04-20 21:12:49.690  (F-E = 0.5s)
+
+OLD LEADER (minority side)  : zookeeper5-1
+NEW LEADER (majority side)  : zookeeper5-4
+OLD LEADER STEPPED DOWN     : True
+SPLIT-BRAIN WINDOW OBSERVED : False
+RECOVERY SECONDS (A to F)   : 76.9
+EXPERIMENT END TIME         : 2026-04-20 21:12:49.690
+==============================================================
+[2026-04-20 21:12:49.691] Run complete - log saved to logs/log_v2_leader_minority_partition_run2.txt

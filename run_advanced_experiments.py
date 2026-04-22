@@ -174,6 +174,38 @@ Academic significance:
   - All 5 nodes expected to go to LOOKING/not_running within ~30 seconds
   - After healing: tests how 5 nodes re-form quorum when partitions lift
 """,
+    "leader_minority_partition": """\
+TEST PURPOSE
+------------
+What: A 5-node ZooKeeper ensemble is partitioned into two groups where the
+      CURRENT LEADER is deliberately placed on the MINORITY (2-node) side:
+        Minority (2/5): [current_leader + one_follower] -- cannot form quorum
+        Majority (3/5): [3 remaining followers]          -- can elect a new leader
+      Groups are assigned dynamically at preflight based on who holds the lease.
+Why:  This directly tests ZAB's response when the active leader loses quorum.
+      The minority-side leader must detect it can no longer reach a majority
+      of ensemble members and step down to LOOKING state.  The majority side
+      must elect a new leader from its 3 nodes (3/5 = 60% > 50% threshold).
+      Unlike Experiment E (which does not guarantee which side gets the leader),
+      this experiment controls the partition topology so the outcome is always:
+        old leader stranded on minority  →  new leader elected on majority.
+Timeline markers captured:
+  A = partition injected
+  B = new leader detected on majority side (1-second zkServer.sh polling)
+  C = write availability confirmed on majority (inferred: majority has leader)
+  D = quorum loss confirmed on minority (all minority pods non-leader/follower)
+  E = partition healed (chaos resource deleted)
+  F = full recovery (all 5 pods Running + exactly 1 leader)
+Academic significance:
+  - Contrasts pod-kill (Experiment A) with network isolation: here the old
+    leader is alive but unreachable, so both sides initially believe they may
+    be leader -- the classic split-brain window is observable.
+  - Measures B-A: time for majority to elect a new leader.
+  - Measures D-A: time for minority to detect quorum loss and step down.
+  - Validates ZAB quorum rule: 2-node minority with the old leader cannot
+    continue serving even though the leader pod is healthy.
+  - Expected: new majority leader within ~5-15s; minority quorum loss ~10-30s.
+""",
 }
 
 
@@ -1372,6 +1404,262 @@ def run_5node_threeway_partition(run_num: int):
 
 
 # ---------------------------------------------------------------------------
+# Experiment G: 5-node — Leader on Minority Side (2+3 partition, leader in 2)
+# ---------------------------------------------------------------------------
+def run_5node_leader_minority_partition(run_num: int):
+    """
+    Partition the 5-node ensemble so the CURRENT LEADER ends up on the
+    MINORITY (2-node) side, ensuring quorum and the new elected leader land
+    on the MAJORITY (3-node) side.
+
+      minority (2 nodes): [current_leader, followers[0]]  -- 2/5, loses quorum
+      majority (3 nodes): [followers[1], followers[2], followers[3]] -- 3/5, elects new leader
+
+    Milestone timestamps:
+      A = inject_dt                 (partition applied)
+      B = new_majority_leader_dt    (first poll: a majority pod reports 'leader')
+      C = majority_write_avail_dt   (inferred = B; majority has an active leader)
+      D = minority_quorum_lost_dt   (first poll: ALL minority pods non-leader/follower)
+      E = removal_dt                (chaos deleted, partition healed)
+      F = recovery_dt               (all 5 Running + exactly 1 leader)
+    """
+    log_path = os.path.join(LOG_DIR, f"log_v2_leader_minority_partition_run{run_num}.txt")
+    logger   = Logger(log_path)
+    start_dt = datetime.now()
+    try:
+        logger.raw(TEST_PURPOSES["leader_minority_partition"])
+        logger.raw("EXPERIMENT: leader_minority_partition  [Experiment G - v2 only, 5-node ensemble]")
+        logger.raw("PARTITION: [current_leader + 1 follower] (minority 2/5)")
+        logger.raw("           vs [3 remaining followers]     (majority 3/5)")
+        logger.raw(f"RUN: {run_num}")
+        logger.raw(f"START TIME: {ts(start_dt)}")
+
+        leader5, followers5 = preflight_5node(logger)
+
+        # Assign groups: minority gets the current leader + first follower
+        minority = [leader5, followers5[0]]
+        majority = followers5[1:4]   # exactly 3 elements
+
+        logger.raw(f"LEADER AT START: {leader5}")
+        logger.raw(f"FOLLOWERS: {followers5}")
+        logger.raw(f"MINORITY GROUP (2/5, has current leader): {minority}")
+        logger.raw(f"MAJORITY GROUP (3/5, will elect new leader): {majority}")
+        logger.raw("")
+        logger.log(
+            f"Partition design: minority={minority} (cannot form quorum) "
+            f"vs majority={majority} (will retain/elect leader)"
+        )
+
+        # Build and apply chaos
+        res_name  = f"v2-leader-minority-r{run_num}"
+        yaml_path = os.path.join(YAML_DIR, f"chaos_v2_leader_minority_run{run_num}_dynamic.yaml")
+        write_yaml(yaml_path,
+                   build_partition_yaml(res_name, minority, majority, duration="60s"))
+        logger.log(f"Generated YAML: {yaml_path}")
+        logger.log(
+            f"  NetworkChaos partition: {minority} <-> {majority}, "
+            f"action=partition, direction=both, duration=60s"
+        )
+
+        inject_dt = apply_chaos(yaml_path)
+        logger.log(f"[A] PARTITION INJECTED at {ts(inject_dt)}: kubectl apply -f {yaml_path}")
+
+        # ---------------------------------------------------------------
+        # Milestone trackers
+        # ---------------------------------------------------------------
+        A_inject_dt              = inject_dt
+        B_new_majority_leader_dt = None   # first majority pod reports 'leader'
+        C_majority_write_avail   = None   # inferred == B
+        D_minority_quorum_lost   = None   # all minority pods non-leader/follower
+        new_majority_leader      = None
+        old_leader_stepped_down  = False
+        split_brain_observed     = False
+
+        logger.log("--- Polling every 1s for 75 seconds (parallel, duration=60s + 15s buffer) ---")
+        logger.log(f"    Minority to watch: {minority}  |  Majority to watch: {majority}")
+        poll_end = time.monotonic() + 75
+
+        while time.monotonic() < poll_end:
+            statuses = poll_statuses(logger, ZK5_PODS)
+            elapsed  = round((datetime.now() - A_inject_dt).total_seconds(), 3)
+
+            old_leader_status = statuses.get(leader5, "unknown")
+
+            # Detect old leader stepping down
+            if old_leader_status != "leader" and not old_leader_stepped_down:
+                old_leader_stepped_down = True
+                logger.log(
+                    f"  [+{elapsed}s] OLD LEADER STEPPED DOWN: {leader5} now "
+                    f"reports '{old_leader_status}'"
+                )
+
+            # Detect split-brain window: old leader still claims 'leader' while
+            # majority has also elected a leader
+            majority_leaders = [p for p in majority if statuses.get(p) == "leader"]
+            if old_leader_status == "leader" and majority_leaders:
+                if not split_brain_observed:
+                    split_brain_observed = True
+                    logger.log(
+                        f"  [+{elapsed}s] SPLIT-BRAIN WINDOW: minority leader {leader5} "
+                        f"still claims 'leader'; majority has also elected {majority_leaders}"
+                    )
+
+            # Milestone B: first majority leader detected
+            if majority_leaders and B_new_majority_leader_dt is None:
+                B_new_majority_leader_dt = datetime.now()
+                C_majority_write_avail   = B_new_majority_leader_dt
+                new_majority_leader      = majority_leaders[0]
+                b_elapsed = round((B_new_majority_leader_dt - A_inject_dt).total_seconds(), 3)
+                logger.log(
+                    f"  [+{b_elapsed}s] [B] NEW LEADER ON MAJORITY SIDE: "
+                    f"{new_majority_leader}  [B-A = {b_elapsed}s]"
+                )
+                logger.log(
+                    f"  [+{b_elapsed}s] [C] MAJORITY WRITE AVAILABLE (inferred): "
+                    f"{new_majority_leader} is active leader => majority side accepting writes"
+                )
+
+            # Milestone D: all minority pods have lost quorum
+            minority_lost = [
+                p for p in minority
+                if statuses.get(p) not in ("leader", "follower")
+            ]
+            if len(minority_lost) == len(minority) and D_minority_quorum_lost is None:
+                D_minority_quorum_lost = datetime.now()
+                d_elapsed = round((D_minority_quorum_lost - A_inject_dt).total_seconds(), 3)
+                logger.log(
+                    f"  [+{d_elapsed}s] [D] MINORITY QUORUM LOST: all minority pods "
+                    f"{minority} report non-quorum status "
+                    f"({[statuses.get(p) for p in minority]})  [D-A = {d_elapsed}s]"
+                )
+
+            time.sleep(1)
+
+        # ---------------------------------------------------------------
+        # Milestone E: heal the partition
+        # ---------------------------------------------------------------
+        if chaos_object_exists("NetworkChaos", res_name):
+            logger.log("Chaos object still present after 75s - deleting manually ...")
+            removal_dt = delete_chaos(yaml_path)
+            logger.log(f"FAULT REMOVED (manual) at {ts(removal_dt)}")
+        else:
+            removal_dt = datetime.now()
+            logger.log(
+                f"Chaos object auto-removed by Chaos Mesh before 75s mark. "
+                f"FAULT REMOVED at {ts(removal_dt)}"
+            )
+        logger.log(f"[E] PARTITION HEALED at {ts(removal_dt)}")
+
+        # ---------------------------------------------------------------
+        # Milestone F: full recovery
+        # ---------------------------------------------------------------
+        logger.log("--- Polling for full recovery (all 5 pods Running, exactly 1 leader) ---")
+        final_leader, recovery_s, recovery_dt = wait_full_recovery_5node(
+            logger, A_inject_dt, timeout_s=300
+        )
+        if recovery_dt:
+            logger.log(
+                f"[F] FULL RECOVERY at {ts(recovery_dt)}: all 5 nodes Running + 1 leader"
+            )
+
+        # ---------------------------------------------------------------
+        # Compute timing deltas
+        # ---------------------------------------------------------------
+        B_minus_A = (
+            round((B_new_majority_leader_dt - A_inject_dt).total_seconds(), 3)
+            if B_new_majority_leader_dt else "N/A"
+        )
+        D_minus_A = (
+            round((D_minority_quorum_lost - A_inject_dt).total_seconds(), 3)
+            if D_minority_quorum_lost else "N/A"
+        )
+        E_minus_A = round((removal_dt - A_inject_dt).total_seconds(), 1)
+        F_minus_E = (
+            round((recovery_dt - removal_dt).total_seconds(), 1)
+            if recovery_dt else "N/A"
+        )
+
+        end_dt = datetime.now()
+
+        # ---------------------------------------------------------------
+        # Timeline summary footer
+        # ---------------------------------------------------------------
+        logger.raw("")
+        logger.raw("=" * 62)
+        logger.raw("TIMELINE SUMMARY")
+        logger.raw("=" * 62)
+        logger.raw(f"[A] PARTITION INJECTED      : {ts(A_inject_dt)}")
+        logger.raw(
+            f"[B] NEW MAJORITY LEADER     : "
+            f"{ts(B_new_majority_leader_dt) if B_new_majority_leader_dt else 'N/A'}"
+            f"  (B-A = {B_minus_A}s)"
+        )
+        logger.raw(
+            f"[C] MAJORITY WRITE AVAIL    : same as B (inferred from leader election)"
+        )
+        logger.raw(
+            f"[D] MINORITY QUORUM LOST    : "
+            f"{ts(D_minority_quorum_lost) if D_minority_quorum_lost else 'N/A'}"
+            f"  (D-A = {D_minus_A}s)"
+        )
+        logger.raw(f"[E] PARTITION HEALED        : {ts(removal_dt)}  (E-A = {E_minus_A}s)")
+        logger.raw(
+            f"[F] FULL RECOVERY           : "
+            f"{ts(recovery_dt) if recovery_dt else 'N/A'}"
+            f"  (F-E = {F_minus_E}s)"
+        )
+        logger.raw("")
+        logger.raw(f"OLD LEADER (minority side)  : {leader5}")
+        logger.raw(f"NEW LEADER (majority side)  : {new_majority_leader or 'not elected during 75s window'}")
+        logger.raw(f"OLD LEADER STEPPED DOWN     : {old_leader_stepped_down}")
+        logger.raw(f"SPLIT-BRAIN WINDOW OBSERVED : {split_brain_observed}")
+        logger.raw(f"RECOVERY SECONDS (A to F)   : {recovery_s}")
+        logger.raw(f"EXPERIMENT END TIME         : {ts(end_dt)}")
+        logger.raw("=" * 62)
+
+        # ---------------------------------------------------------------
+        # CSV / summary
+        # ---------------------------------------------------------------
+        notes_parts = [
+            f"minority={minority}, majority={majority}",
+            f"B-A={B_minus_A}s (majority leader election latency from partition inject)",
+            f"D-A={D_minus_A}s (minority quorum loss detection latency)",
+            f"F-E={F_minus_E}s (recovery latency after partition healed)",
+            f"old_leader_stepped_down={old_leader_stepped_down}",
+            f"split_brain_window={split_brain_observed}",
+        ]
+        if new_majority_leader:
+            notes_parts.append(f"new_leader={new_majority_leader}")
+        if recovery_dt is None:
+            notes_parts.append("RECOVERY TIMEOUT")
+
+        append_result({
+            "experiment":         "leader_minority_partition",
+            "run":                run_num,
+            "ensemble":           "5-node",
+            "leader_before":      leader5,
+            "leader_after":       final_leader or "unknown",
+            "leadership_changed": "yes" if new_majority_leader else "no",
+            "injection_time":     ts(A_inject_dt),
+            "recovery_time":      ts(recovery_dt) if recovery_dt else "timeout",
+            "recovery_seconds":   recovery_s,
+            "quorum_lost":        f"minority_only (minority_pods={minority})",
+            "notes":              "; ".join(notes_parts),
+        })
+        _summary_rows.append({
+            "experiment":        "G:leader_minority_partition",
+            "run":               run_num,
+            "leader_before":     leader5,
+            "leader_after":      final_leader or "unknown",
+            "election_latency_s": B_minus_A if isinstance(B_minus_A, float) else None,
+            "recovery_s":        recovery_s,
+        })
+        logger.log(f"Run complete - log saved to {log_path}")
+    finally:
+        logger.close()
+
+
+# ---------------------------------------------------------------------------
 # ZooKeeper5 StatefulSet lifecycle
 # ---------------------------------------------------------------------------
 def deploy_zookeeper5(logger=None):
@@ -1454,6 +1742,7 @@ def cleanup_all():
             ("NetworkChaos", f"v2-5node-majority-r{n}"),
             ("NetworkChaos", f"v2-5node-3way-nc1-r{n}"),
             ("NetworkChaos", f"v2-5node-3way-nc2-r{n}"),
+            ("NetworkChaos", f"v2-leader-minority-r{n}"),
         ]:
             subprocess.run(
                 ["kubectl", "delete", kind, name,
@@ -1501,6 +1790,7 @@ def print_summary():
         ("log_v2_threeway_isolation", 3),
         ("log_v2_5node_majority_partition", 3),
         ("log_v2_5node_threeway_partition", 3),
+        ("log_v2_leader_minority_partition", 3),
     ]:
         for n in range(1, runs + 1):
             print(f"  {os.path.join(LOG_DIR, exp + '_run' + str(n) + '.txt')}")
@@ -1629,6 +1919,21 @@ def main():
                 time.sleep(90)
 
         print(f"\n[{ts()}] === EXPERIMENT F COMPLETE ===")
+        print(f"[{ts()}] Waiting 90s before Experiment G ...")
+        time.sleep(90)
+
+        # -- Experiment G: 5-Node Leader-on-Minority Partition (3 runs) --------
+        print(f"\n[{ts()}] === EXPERIMENT G: 5-NODE LEADER-MINORITY PARTITION - 3 runs ===")
+        print(f"[{ts()}]   Partition: [current_leader + 1 follower] (minority 2/5)")
+        print(f"[{ts()}]   vs [3 remaining followers] (majority 3/5, elects new leader)")
+        for run in range(1, 4):
+            print(f"\n[{ts()}] --- Leader-Minority Partition Run {run}/3 ---")
+            run_5node_leader_minority_partition(run)
+            if run < 3:
+                print(f"[{ts()}] Waiting 90s for cluster stabilisation before next run ...")
+                time.sleep(90)
+
+        print(f"\n[{ts()}] === EXPERIMENT G COMPLETE ===")
 
     except KeyboardInterrupt:
         print(f"\n[{ts()}] Interrupted. Running cleanup ...")

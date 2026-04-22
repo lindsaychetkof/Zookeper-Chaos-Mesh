@@ -1,0 +1,31 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: v2-leader-minority-r2
+  namespace: default
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - default
+    expressionSelectors:
+      - key: statefulset.kubernetes.io/pod-name
+        operator: In
+        values:
+          - zookeeper5-1
+          - zookeeper5-0
+  direction: both
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - default
+      expressionSelectors:
+        - key: statefulset.kubernetes.io/pod-name
+          operator: In
+          values:
+          - zookeeper5-2
+          - zookeeper5-3
+          - zookeeper5-4
+  duration: "60s"
