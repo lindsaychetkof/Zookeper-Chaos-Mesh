@@ -22,4 +22,4 @@ Python, Kubernetes, Minikube, Docker, Chaos Mesh, Apache ZooKeeper
 
 ## Main Artifacts
 - Final report: `CS 390 FINAL REPORT CHAOS KEEPERS.pdf`
-- Presentation: `CS390 Final Presentation.pdf`
+- Presentation: `CS390-Final-Presentation.pdf`
